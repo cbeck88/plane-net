@@ -18,18 +18,26 @@ In-flight networks fail in a few typical ways:
 | File | What it does |
 |---|---|
 | `plane-net` | Diagnoses portal, path MTU, and GitHub SSH; optionally lowers the MTU |
-| `ssh-config-github` | `~/.ssh/config` block: SSH over 443, connection reuse, long timeouts, small key exchange |
+| `ssh-config-github` | `~/.ssh/config` block: SSH over 443, connection reuse, dead-link detection, small key exchange |
 | `99-mtu.conf` | sysctl that enables TCP MTU probing |
+| `install.sh` | Installs all of the above; safe to rerun |
 
 ## Install
 
 ```bash
-ln -sf ~/plane-net/plane-net ~/bin/plane-net
-cat ~/plane-net/ssh-config-github >> ~/.ssh/config
-sudo cp ~/plane-net/99-mtu.conf /etc/sysctl.d/ && sudo sysctl --system
+~/plane-net/install.sh
 ```
 
-`~/bin` is added to `PATH` by Ubuntu's `~/.profile` at login, if the directory exists.
+This:
+
+- links `~/bin/plane-net` (creating `~/bin` if needed),
+- adds `Include ~/plane-net/ssh-config-github` to the **top** of `~/.ssh/config`.
+  OpenSSH uses the first value it finds for each option, so a `Host` block
+  above it would override it,
+- installs `99-mtu.conf` to `/etc/sysctl.d/` (sudo).
+
+Ubuntu's `~/.profile` only adds `~/bin` to `PATH` if it existed at login, so a
+fresh `~/bin` needs a re-login.
 
 ## Before the flight
 
@@ -42,19 +50,28 @@ sudo cp ~/plane-net/99-mtu.conf /etc/sysctl.d/ && sudo sysctl --system
 ```bash
 plane-net           # diagnose only
 plane-net --apply   # also set the interface MTU to the probed value (sudo)
-plane-net --reset   # restore MTU 1500 (sudo)
+plane-net --reset   # restore the MTU that --apply replaced (sudo)
 ```
 
 `plane-net` checks, in order:
 
 1. **Portal:** fetches a URL that returns 204 unless intercepted. If
-   intercepted, open `http://neverssl.com` and log in, then rerun.
-2. **MTU:** binary-searches the largest unfragmented ping to github.com.
-   If ping is blocked entirely, guess with `sudo ip link set <iface> mtu 1400`.
-3. **GitHub:** attempts SSH auth to `git@github.com`.
+   intercepted, open `http://neverssl.com` and log in, then rerun. No response
+   at all is reported separately as no connectivity.
+2. **MTU:** binary-searches the largest unfragmented ping to `1.1.1.1`, down
+   to 576. GitHub's hosts aren't used, because some drop large pings. If ping is blocked entirely,
+   guess with `sudo ip link set <iface> mtu 1400`. ping can't send past the
+   interface MTU, so after `--apply` the probe can't see a better path until
+   `--reset`.
+3. **GitHub:** attempts SSH auth on a fresh connection, bypassing any shared
+   connection whose link may have died.
+
+`--apply` records the interface and its original MTU, and `--reset` restores
+exactly that, even if the default route has since moved (e.g. to a VPN).
 
 After one SSH connection succeeds, later git commands reuse it (via
-`ControlMaster`) and skip the handshake.
+`ControlMaster`) and skip the handshake. If the link drops, that shared
+connection is closed after about 45 s and the next command opens a new one.
 
 If everything passes and git still hangs, the cause is likely throttling or the
 link dropping, not MTU.

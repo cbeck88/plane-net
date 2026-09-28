@@ -1,15 +1,22 @@
-# Append to ~/.ssh/config.
+# Included from the top of ~/.ssh/config by install.sh. OpenSSH uses the first
+# value it finds for each option, so a Host block above the Include overrides this.
 #
 # Port 443: some in-flight networks block or throttle port 22.
+# HostKeyAlias: ssh.github.com:443 serves github.com's host key; without the alias,
+#   ssh looks up "[ssh.github.com]:443" in known_hosts and fails verification.
 # ControlMaster: one slow handshake, then every git command reuses the connection.
+# ServerAlive*: a master whose link died is dropped after ~45 s, so new commands
+#   stop queueing behind it.
 # KexAlgorithms: avoids the ~1.2 KB post-quantum key exchange packet, which can
 #   stall on paths with a small MTU. Remove it once off the plane if you want PQ kex back.
 Host github.com
   Hostname ssh.github.com
   Port 443
+  HostKeyAlias github.com
   ControlMaster auto
   ControlPath ~/.ssh/cm-%r@%h:%p
-  ControlPersist 30m
-  ServerAliveInterval 30
+  ControlPersist 10m
+  ServerAliveInterval 15
+  ServerAliveCountMax 3
   ConnectTimeout 60
   KexAlgorithms curve25519-sha256

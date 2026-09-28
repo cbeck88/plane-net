@@ -3,57 +3,95 @@
 #
 #   plane-net           diagnose only
 #   plane-net --apply   also lower the interface MTU to the probed value (sudo)
-#   plane-net --reset   restore MTU 1500 (sudo)
+#   plane-net --reset   restore the MTU that --apply replaced (sudo)
 set -u
 
-HOST=github.com
-IFACE=$(ip route get 1.1.1.1 2>/dev/null | grep -Po 'dev \K\S+')
-[ -n "$IFACE" ] || { echo "no default route -- are you connected?"; exit 1; }
+# MTU probe target. GitHub's own hosts can't be used: some drop pings over ~100
+# bytes, which reads as a tiny MTU. The in-flight link is the bottleneck either way.
+PROBE=1.1.1.1
+# --apply records "<interface> <original mtu>" here; --reset restores exactly that.
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/plane-net/applied
 
-if [ "${1:-}" = "--reset" ]; then
-  sudo ip link set "$IFACE" mtu 1500 && echo "$IFACE mtu reset to 1500"
+usage() { sed -n '4,6s/^# //p' "$0"; }
+
+mode=diagnose
+case "${1:-}" in
+  '') ;;
+  --apply) mode=apply ;;
+  --reset) mode=reset ;;
+  -h | --help) usage; exit ;;
+  *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+esac
+
+if [ "$mode" = reset ]; then
+  [ -r "$STATE" ] || { echo "nothing to reset: no MTU change recorded by --apply"; exit 1; }
+  read -r iface orig < "$STATE"
+  sudo ip link set "$iface" mtu "$orig" && rm -f "$STATE" && echo "$iface mtu restored to $orig"
   exit
 fi
 
-echo "interface: $IFACE (mtu $(cat /sys/class/net/"$IFACE"/mtu))"
+IFACE=$(ip route get 1.1.1.1 2>/dev/null | grep -Po 'dev \K\S+')
+[ -n "$IFACE" ] || { echo "no default route -- are you connected?"; exit 1; }
+LOCAL_MTU=$(cat /sys/class/net/"$IFACE"/mtu)
+echo "interface: $IFACE (mtu $LOCAL_MTU)"
 
 # 1. Captive portal: this URL returns 204 unless something intercepts it.
-code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 http://connectivitycheck.gstatic.com/generate_204)
-if [ "$code" = 204 ]; then
-  echo "portal:    ok (not intercepted)"
-else
-  echo "portal:    INTERCEPTED (http $code) -- open http://neverssl.com and log in, then rerun"
-  exit 1
-fi
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 http://connectivitycheck.gstatic.com/generate_204)
+case "$code" in
+  204) echo "portal:    ok (not intercepted)" ;;
+  000) echo "portal:    NO CONNECTIVITY (DNS failure, link down, or timed out)"; exit 1 ;;
+  *) echo "portal:    INTERCEPTED (http $code) -- open http://neverssl.com and log in, then rerun"; exit 1 ;;
+esac
 
-# 2. Path MTU: binary search for the largest unfragmented ICMP payload.
-# Several pings per size, because in-flight links drop packets at random.
-fits() { ping -q -c3 -i0.3 -W3 -M do -s "$1" "$HOST" >/dev/null 2>&1; }
-if ! fits 1200; then
-  echo "mtu:       can't probe (ping blocked?) -- guess instead: sudo ip link set $IFACE mtu 1400"
-  mtu=
-elif fits 1472; then
-  echo "mtu:       1500 works, MTU is not the problem"
-  mtu=1500
+# 2. Path MTU: binary search for the largest unfragmented ICMP payload
+# (packet = payload + 28 bytes). Several pings per size, because in-flight links
+# drop packets at random. ping cannot send past the interface MTU, so the search
+# tops out at LOCAL_MTU.
+fits() { ping -q -c3 -i0.3 -W3 -M "do" -s "$1" "$PROBE" >/dev/null 2>&1; }
+lo=548 hi=$((LOCAL_MTU - 28))
+mtu=
+if ! fits 56; then
+  echo "mtu:       can't probe (ping to $PROBE blocked?) -- guess instead: sudo ip link set $IFACE mtu 1400"
+elif fits "$hi"; then
+  mtu=$LOCAL_MTU
+  if [ "$LOCAL_MTU" -ge 1500 ]; then
+    echo "mtu:       $LOCAL_MTU works, MTU is not the problem"
+  else
+    echo "mtu:       $LOCAL_MTU works (can't probe above the interface MTU; plane-net --reset to allow it)"
+  fi
+elif ! fits "$lo"; then
+  echo "mtu:       path MTU is below 576 -- this link is unusually constrained"
 else
-  lo=1200 hi=1472
   while [ $((hi - lo)) -gt 1 ]; do
     mid=$(((lo + hi) / 2))
     if fits "$mid"; then lo=$mid; else hi=$mid; fi
   done
   mtu=$((lo + 28))
-  echo "mtu:       path MTU is $mtu (full-size packets are dropped)"
+  echo "mtu:       path MTU is $mtu (larger packets are dropped)"
 fi
 
-if [ "${1:-}" = "--apply" ] && [ -n "$mtu" ] && [ "$mtu" -lt 1500 ]; then
-  sudo ip link set "$IFACE" mtu "$mtu" && echo "           set $IFACE mtu $mtu (undo: plane-net --reset)"
-elif [ -n "$mtu" ] && [ "$mtu" -lt 1500 ]; then
+if [ "$mode" = apply ]; then
+  if [ -z "$mtu" ]; then
+    echo "           not applied: MTU could not be measured"
+  elif [ "$mtu" -ge "$LOCAL_MTU" ]; then
+    echo "           nothing to apply: $IFACE is already at $LOCAL_MTU"
+  elif [ -r "$STATE" ] && [ "$(cut -d' ' -f1 "$STATE")" != "$IFACE" ]; then
+    echo "           not applied: $(cut -d' ' -f1 "$STATE") still has an MTU change -- plane-net --reset first"
+  elif sudo ip link set "$IFACE" mtu "$mtu"; then
+    # Repeated --apply keeps the MTU from before the first one.
+    [ -r "$STATE" ] || { mkdir -p "$(dirname "$STATE")" && echo "$IFACE $LOCAL_MTU" > "$STATE"; }
+    echo "           set $IFACE mtu $mtu (undo: plane-net --reset)"
+  fi
+elif [ -n "$mtu" ] && [ "$mtu" -lt "$LOCAL_MTU" ]; then
   echo "           rerun with --apply to set it"
 fi
 
-# 3. GitHub SSH: a successful auth prints "successfully authenticated" and exits 1.
-if timeout 90 ssh -T -o BatchMode=yes -o ConnectTimeout=60 git@"$HOST" 2>&1 | grep -q 'successfully authenticated'; then
+# 3. GitHub SSH over a fresh connection, bypassing any ControlMaster whose link
+# may have died. A successful auth prints "successfully authenticated" and exits 1.
+out=$(timeout 90 ssh -T -o BatchMode=yes -o ConnectTimeout=60 -o ControlMaster=no -o ControlPath=none git@github.com 2>&1)
+if grep -q 'successfully authenticated' <<< "$out"; then
   echo "github:    ssh auth ok"
 else
-  echo "github:    ssh FAILED -- see: ssh -vT git@$HOST"
+  echo "github:    ssh FAILED: $(tail -1 <<< "${out:-timed out}")"
+  echo "           details: ssh -vT git@github.com"
 fi
