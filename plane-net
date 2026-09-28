@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Diagnose flaky in-flight Wi-Fi: captive portal, path MTU, and GitHub SSH.
+#
+#   plane-net           diagnose only
+#   plane-net --apply   also lower the interface MTU to the probed value (sudo)
+#   plane-net --reset   restore MTU 1500 (sudo)
+set -u
+
+HOST=github.com
+IFACE=$(ip route get 1.1.1.1 2>/dev/null | grep -Po 'dev \K\S+')
+[ -n "$IFACE" ] || { echo "no default route -- are you connected?"; exit 1; }
+
+if [ "${1:-}" = "--reset" ]; then
+  sudo ip link set "$IFACE" mtu 1500 && echo "$IFACE mtu reset to 1500"
+  exit
+fi
+
+echo "interface: $IFACE (mtu $(cat /sys/class/net/"$IFACE"/mtu))"
+
+# 1. Captive portal: this URL returns 204 unless something intercepts it.
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 http://connectivitycheck.gstatic.com/generate_204)
+if [ "$code" = 204 ]; then
+  echo "portal:    ok (not intercepted)"
+else
+  echo "portal:    INTERCEPTED (http $code) -- open http://neverssl.com and log in, then rerun"
+  exit 1
+fi
+
+# 2. Path MTU: binary search for the largest unfragmented ICMP payload.
+# Several pings per size, because in-flight links drop packets at random.
+fits() { ping -q -c3 -i0.3 -W3 -M do -s "$1" "$HOST" >/dev/null 2>&1; }
+if ! fits 1200; then
+  echo "mtu:       can't probe (ping blocked?) -- guess instead: sudo ip link set $IFACE mtu 1400"
+  mtu=
+elif fits 1472; then
+  echo "mtu:       1500 works, MTU is not the problem"
+  mtu=1500
+else
+  lo=1200 hi=1472
+  while [ $((hi - lo)) -gt 1 ]; do
+    mid=$(((lo + hi) / 2))
+    if fits "$mid"; then lo=$mid; else hi=$mid; fi
+  done
+  mtu=$((lo + 28))
+  echo "mtu:       path MTU is $mtu (full-size packets are dropped)"
+fi
+
+if [ "${1:-}" = "--apply" ] && [ -n "$mtu" ] && [ "$mtu" -lt 1500 ]; then
+  sudo ip link set "$IFACE" mtu "$mtu" && echo "           set $IFACE mtu $mtu (undo: plane-net --reset)"
+elif [ -n "$mtu" ] && [ "$mtu" -lt 1500 ]; then
+  echo "           rerun with --apply to set it"
+fi
+
+# 3. GitHub SSH: a successful auth prints "successfully authenticated" and exits 1.
+if timeout 90 ssh -T -o BatchMode=yes -o ConnectTimeout=60 git@"$HOST" 2>&1 | grep -q 'successfully authenticated'; then
+  echo "github:    ssh auth ok"
+else
+  echo "github:    ssh FAILED -- see: ssh -vT git@$HOST"
+fi

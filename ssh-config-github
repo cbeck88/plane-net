@@ -1,0 +1,15 @@
+# Append to ~/.ssh/config.
+#
+# Port 443: some in-flight networks block or throttle port 22.
+# ControlMaster: one slow handshake, then every git command reuses the connection.
+# KexAlgorithms: avoids the ~1.2 KB post-quantum key exchange packet, which can
+#   stall on paths with a small MTU. Remove it once off the plane if you want PQ kex back.
+Host github.com
+  Hostname ssh.github.com
+  Port 443
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%r@%h:%p
+  ControlPersist 30m
+  ServerAliveInterval 30
+  ConnectTimeout 60
+  KexAlgorithms curve25519-sha256
